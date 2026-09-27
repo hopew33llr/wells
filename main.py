@@ -1432,7 +1432,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @admin_only
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(Exception):
+        await query.answer()
     data = query.data or ""
     if data == "noop":
         return
