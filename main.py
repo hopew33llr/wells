@@ -60,13 +60,13 @@ from crypto_utils import encrypt
 from html_generator import generate_html
 from uploader import extract_variable, upload_file
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-ZIP_PASS = os.environ["ZIP_PASS"]
-CRYPT_PASS = os.environ["CRYPT_PASS"]
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+ADMIN_ID = int(os.environ["ADMIN_ID"].strip())
+API_ID = int(os.environ["API_ID"].strip())
+API_HASH = os.environ["API_HASH"].strip()
+SESSION_STRING = os.environ["SESSION_STRING"].strip()
+ZIP_PASS = os.environ["ZIP_PASS"].strip()
+CRYPT_PASS = os.environ["CRYPT_PASS"].strip()
 
 BALE_BASE_URL = "https://tapi.bale.ai/bot"
 BALE_BASE_FILE_URL = "https://tapi.bale.ai/file/bot"
