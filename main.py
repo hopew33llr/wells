@@ -839,17 +839,17 @@ async def _build_fallback_bundle(
 
 
 async def _deliver_link_result(job: ExportJob, cdn_url: str) -> None:
-    """لینک را به‌صورت ساده (رمزگشایی‌شده/متن خوانا) ارسال می‌کند."""
-    message = await job.context.bot.send_message(
+    """دقیقاً مثل نسخهٔ اصلی: متغیر CDN را استخراج، رمزگذاری و به‌صورت ciphertext ارسال می‌کند."""
+    encrypted = encrypt(extract_variable(cdn_url), CRYPT_PASS)
+    ready_message = await job.context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=(
-            f"✅ خروجی «{job.label}» آماده شد.\n\n"
-            f"لینک فایل: {cdn_url}\n\n"
-            "راهنما: فایل را دانلود کنید، پسوند آن را به .zip تغییر دهید و با رمز خودتان "
-            "از حالت فشرده خارج کنید؛ سپس index.html را در مرورگر باز کنید."
-        ),
+        text=f"✅ خروجی «{job.label}» آماده شد.\nمتن رمز‌شده در پیام بعدی است.",
     )
-    _track_message(job.context, message.message_id)
+    _track_message(job.context, ready_message.message_id)
+    encrypted_message = await job.context.bot.send_message(
+        chat_id=ADMIN_ID, text=encrypted
+    )
+    _track_message(job.context, encrypted_message.message_id)
 
 
 async def run_export_job(job: ExportJob) -> None:
