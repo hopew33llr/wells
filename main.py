@@ -1023,19 +1023,35 @@ async def _send_channel_selector(
     total_pages = max(1, math.ceil(len(channels) / CHANNELS_PER_PAGE))
     page = max(0, min(int(context.user_data.get("channel_page", 0)), total_pages - 1))
     context.user_data["channel_page"] = page
-    if old_message_id:
-        with contextlib.suppress(Exception):
-            await context.bot.delete_message(chat_id=ADMIN_ID, message_id=old_message_id)
     caption = (
         "📡 کانال‌های موردنظر را انتخاب کنید:\n"
         f"✅ انتخاب‌شده: {len(selected_ids)} از {len(channels)}\n"
         f"📄 صفحه {page + 1} از {total_pages}\n"
         "در پایان روی «ادامه» بزنید."
     )
+    keyboard = _channel_keyboard(channels, selected_ids, page)
+    if old_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=ADMIN_ID,
+                message_id=old_message_id,
+                text=caption,
+                reply_markup=keyboard,
+            )
+            return old_message_id
+        except Exception as exc:
+            # اگر متن/کیبورد تغییری نکرده بود، بله معمولاً خطای
+            # "message is not modified" می‌دهد؛ در این حالت پیام همان
+            # پیام قبلی است و نیازی به ارسال دوباره نیست.
+            if "not modified" in str(exc).lower():
+                return old_message_id
+            logger.warning("ویرایش پیام انتخاب کانال ناموفق بود، پیام جدید ارسال می‌شود: %s", exc)
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat_id=ADMIN_ID, message_id=old_message_id)
     message = await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=caption,
-        reply_markup=_channel_keyboard(channels, selected_ids, page),
+        reply_markup=keyboard,
     )
     return message.message_id
 
