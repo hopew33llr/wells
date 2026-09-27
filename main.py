@@ -1543,7 +1543,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import TimedOut as _TimedOut, NetworkError as _NetErr
     import traceback as _tb
+    # TimedOut و NetworkError در ایران خیلی معمول‌اند؛ فقط لاگ کن، پیام نفرست
+    if isinstance(context.error, (_TimedOut, _NetErr)):
+        logger.warning("شبکه: %s", context.error)
+        return
     err_lines = _tb.format_exception(type(context.error), context.error, context.error.__traceback__)
     err_text = "".join(err_lines)
     logger.error("خطا در آپدیت %s:\n%s", update, err_text)
@@ -1569,6 +1574,10 @@ async def _run_bot() -> None:
         .token(BOT_TOKEN)
         .base_url(BALE_BASE_URL)
         .base_file_url(BALE_BASE_FILE_URL)
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(60)
         .build()
     )
     state = _load_state()
