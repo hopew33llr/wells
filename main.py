@@ -1542,14 +1542,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هندلر خطای سراسری python-telegram-bot: هر استثنای پیش‌بینی‌نشده در پردازش
-    یک آپدیت را فقط لاگ می‌کند و به ادمین اطلاع می‌دهد، بدون این‌که پردازش
-    آپدیت‌های بعدی یا اصلِ ربات را متوقف کند."""
-    logger.error("خطای پیش‌بینی‌نشده هنگام پردازش آپدیت: %s", update, exc_info=context.error)
+    import traceback as _tb
+    err_lines = _tb.format_exception(type(context.error), context.error, context.error.__traceback__)
+    err_text = "".join(err_lines)
+    logger.error("خطا در آپدیت %s:\n%s", update, err_text)
+    snippet = err_text[-3000:].replace("<", "&lt;").replace(">", "&gt;")
     with contextlib.suppress(Exception):
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text="⚠️ یک خطای غیرمنتظره رخ داد اما ربات بدون مشکل به کار خود ادامه می‌دهد.",
+            text=f"\u26a0\ufe0f <b>خطا:</b>\n<pre>{snippet}</pre>",
+            parse_mode="HTML",
         )
 
 
