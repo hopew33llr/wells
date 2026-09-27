@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -112,11 +114,20 @@ STATE_BACKUP_DIR = Path(
     os.environ.get("STATE_BACKUP_DIR", str(DATA_DIR / "backups"))
 ).expanduser()
 
-SPLIT_SIZE_BYTES = 10 * 1024 * 1024
 AUTO_DELETE_HOURS = 4
 MEDIA_CONCURRENCY = max(2, int(os.environ.get("MEDIA_CONCURRENCY", "8")))
 DEFAULT_MESSAGE_COUNT = 30
 DEFAULT_MAX_ZIP_MB = 50
+CHANNELS_PER_PAGE = 8
+# بله حداکثر حجم فایل ارسالی توسط ربات را ۵۰ مگابایت تعیین کرده؛ برای اطمینان
+# (سربار پروتکل / تفاوت محاسبهٔ حجم) کمی پایین‌تر از آن تقسیم می‌کنیم.
+BALE_MAX_FILE_MB = 50
+DIRECT_SEND_CHUNK_MB = max(1, int(os.environ.get("DIRECT_SEND_CHUNK_MB", "45")))
+DIRECT_SEND_CHUNK_BYTES = DIRECT_SEND_CHUNK_MB * 1024 * 1024
+# سقف ایمنی حجم کل بستهٔ export برای حالت «ارسال مستقیم» (که خودش بعداً به
+# چند بخش ≤۴۵ مگابایتی تقسیم می‌شود) تا export‌های خیلی بزرگ باعث اشغال
+# طولانی‌مدت صف یا timeout نشوند.
+DIRECT_SEND_SAFETY_CAP_MB = max(BALE_MAX_FILE_MB, int(os.environ.get("DIRECT_SEND_SAFETY_CAP_MB", "500")))
 STATE_BACKUP_KEEP = max(2, int(os.environ.get("STATE_BACKUP_KEEP", "14")))
 STATE_BACKUP_INTERVAL_SECONDS = max(
     300, int(os.environ.get("STATE_BACKUP_INTERVAL_SECONDS", str(6 * 3600)))
@@ -496,32 +507,99 @@ def create_protected_zip(html_content: str, media_dir: Path, zip_path: Path) -> 
                     zip_file.write(path, arcname=f"media/{path.relative_to(media_dir)}")
 
 
-def split_file(file_path: Path, part_size: int = SPLIT_SIZE_BYTES) -> list[Path]:
-    parts: list[Path] = []
-    with file_path.open("rb") as source:
-        index = 1
-        while chunk := source.read(part_size):
-            part = Path(f"{file_path}.part{index}")
-            part.write_bytes(chunk)
-            parts.append(part)
-            index += 1
-    return parts
+def _sha256_of_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-async def send_zip_parts_to_bale(context: ContextTypes.DEFAULT_TYPE, zip_path: Path) -> None:
-    parts = split_file(zip_path)
-    total = len(parts)
-    for index, part in enumerate(parts, 1):
+async def _send_part_with_retry(
+    job: "ExportJob", part_path: Path, index: int, total: int, max_attempts: int = 4
+) -> None:
+    """ارسال هر بخش با تلاش مجدد؛ هرگز استثنا را بدون تلاش کافی بالا نمی‌فرستد
+    مگر بعد از چند بار امتحان، تا یک قطعی موقتی شبکه کل export را خراب نکند."""
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        if job.cancelled:
+            raise asyncio.CancelledError
         try:
-            with part.open("rb") as fh:
-                await context.bot.send_document(
+            with part_path.open("rb") as fh:
+                await job.context.bot.send_document(
                     chat_id=ADMIN_ID,
                     document=fh,
-                    filename=f"export_part{index}of{total}.zip",
+                    filename=part_path.name,
                 )
-        finally:
-            with contextlib.suppress(OSError):
-                part.unlink()
+            return
+        except Exception as exc:  # noqa: BLE001 - می‌خواهیم هر خطایی را retry کنیم
+            last_error = exc
+            logger.warning(
+                "ارسال بخش %d از %d (تلاش %d) ناموفق بود: %s", index, total, attempt, exc
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(3 * attempt)
+    raise last_error or RuntimeError(f"ارسال بخش {index} ناموفق ماند")
+
+
+async def send_zip_as_stealth_parts(job: "ExportJob", zip_path: Path) -> None:
+    """فایل ZIP رمزدار را در بخش‌های ≤ DIRECT_SEND_CHUNK_MB مگابایتی، با پسوند
+    ظاهری .jpg (فقط تغییر نام، محتوا دست‌نخورده باقی می‌ماند) مستقیماً از طریق
+    ربات بله ارسال می‌کند. این کار محدودیت ۵۰ مگابایتی بله را دور می‌زند و
+    نیازی به آپلود در سرور بیرونی ندارد."""
+    total_size = zip_path.stat().st_size
+    total_parts = max(1, math.ceil(total_size / DIRECT_SEND_CHUNK_BYTES))
+    digest = await asyncio.to_thread(_sha256_of_file, zip_path)
+
+    part_dir = zip_path.parent / "parts"
+    part_dir.mkdir(exist_ok=True)
+    sent = 0
+    try:
+        with zip_path.open("rb") as source:
+            index = 0
+            while True:
+                chunk = await asyncio.to_thread(source.read, DIRECT_SEND_CHUNK_BYTES)
+                if not chunk:
+                    break
+                index += 1
+                # پسوند jpg صرفاً برای stealth (عبور راحت‌تر در شرایط فیلترینگ)
+                # به نام فایل اضافه می‌شود؛ محتوای باینری بدون هیچ تغییری همان
+                # تکهٔ خام فایل ZIP رمزدار است.
+                part_name = f"export_{index:02d}of{total_parts:02d}.jpg"
+                part_path = part_dir / part_name
+                await asyncio.to_thread(part_path.write_bytes, chunk)
+                try:
+                    await _send_part_with_retry(job, part_path, index, total_parts)
+                    sent += 1
+                finally:
+                    with contextlib.suppress(OSError):
+                        part_path.unlink()
+                await _set_progress(
+                    job,
+                    min(98, 70 + int(index / total_parts * 28)),
+                    f"ارسال بخش {index} از {total_parts}",
+                )
+    finally:
+        shutil.rmtree(part_dir, ignore_errors=True)
+
+    guide = await job.context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"✅ فایل در {sent} از {total_parts} بخش با پسوند ظاهری .jpg ارسال شد.\n"
+            f"حجم کل فایل اصلی: {_format_bytes(total_size)}\n"
+            f"کد یکپارچگی SHA-256: {digest[:20]}…\n\n"
+            "🧩 راهنمای بازسازی فایل:\n"
+            "۱) همهٔ بخش‌ها را به‌ترتیبِ شمارهٔ داخل نامشان در یک پوشه ذخیره کنید "
+            "(محتوای فایل‌ها دست‌نخورده است؛ پسوند jpg فقط برای عبور امن‌تر است).\n"
+            "۲) در لینوکس/مک: cat export_*.jpg > export.zip\n"
+            "   در ویندوز (Command Prompt): copy /b export_01of*.jpg+export_02of*.jpg export.zip "
+            "یا فایل‌ها را به‌ترتیب به هم بچسبانید.\n"
+            "۳) با رمز خودتان export.zip را از حالت فشرده خارج کنید و index.html را باز کنید."
+        ),
+    )
+    _track_message(job.context, guide.message_id)
+    if sent < total_parts:
+        raise RuntimeError(f"فقط {sent} از {total_parts} بخش ارسال شد")
 
 
 def upload_with_retry(file_path: str, max_attempts: int = 3) -> str:
@@ -545,6 +623,7 @@ class ExportJob:
     max_zip_mb: int = DEFAULT_MAX_ZIP_MB
     max_media_bytes: Optional[int] = None
     label: str = "export"
+    delivery: str = "link"  # "link" = آپلود و دریافت لینک، "direct" = ارسال مستقیم بخش‌بخش
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     progress_message_id: Optional[int] = None
     progress: int = 0
@@ -759,43 +838,71 @@ async def _build_fallback_bundle(
     return zip_path, work_dir, payload
 
 
-async def _deliver_result(job: ExportJob, encrypted: str) -> None:
-    ready_message = await job.context.bot.send_message(
+async def _deliver_link_result(job: ExportJob, cdn_url: str) -> None:
+    """لینک را به‌صورت ساده (رمزگشایی‌شده/متن خوانا) ارسال می‌کند."""
+    message = await job.context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=f"✅ خروجی «{job.label}» آماده شد.\nمتن رمز‌شده در پیام بعدی است.",
+        text=(
+            f"✅ خروجی «{job.label}» آماده شد.\n\n"
+            f"لینک فایل: {cdn_url}\n\n"
+            "راهنما: فایل را دانلود کنید، پسوند آن را به .zip تغییر دهید و با رمز خودتان "
+            "از حالت فشرده خارج کنید؛ سپس index.html را در مرورگر باز کنید."
+        ),
     )
-    _track_message(job.context, ready_message.message_id)
-    encrypted_message = await job.context.bot.send_message(
-        chat_id=ADMIN_ID, text=encrypted
-    )
-    _track_message(job.context, encrypted_message.message_id)
+    _track_message(job.context, message.message_id)
 
 
 async def run_export_job(job: ExportJob) -> None:
+    """هرگز نباید استثنایی را بدون گزارش به کاربر و بدون پاک‌سازی فایل‌های موقت رها کند؛
+    خطاهای پیش‌بینی‌نشده اینجا گرفته می‌شوند تا کل ربات پایین نیاید."""
     job.started_at = time.monotonic()
     work_dir: Optional[Path] = None
     try:
         await _set_progress(job, 5, f"صف {job.label} · {len(job.channels)} کانال")
         zip_path, work_dir, _ = await _fit_bundle(job)
-        await _set_progress(job, 65, "بسته آماده شد")
+        await _set_progress(job, 60, "بسته آماده شد")
+
+        if job.delivery == "direct":
+            await _set_progress(job, 70, "در حال ارسال مستقیم بخش‌ها...")
+            await send_zip_as_stealth_parts(job, zip_path)
+            await _set_progress(job, 100, "✅ ارسال مستقیم کامل شد.")
+            return
 
         upload_copy = work_dir / "export.jpg"
         await asyncio.to_thread(shutil.copyfile, zip_path, upload_copy)
         try:
             cdn_url = await asyncio.to_thread(upload_with_retry, str(upload_copy))
-        except Exception:
-            await send_zip_parts_to_bale(job.context, zip_path)
+        except Exception as exc:
+            logger.warning("آپلود لینک برای export %s ناموفق بود: %s", job.job_id, exc)
+            with contextlib.suppress(Exception):
+                notice = await job.context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text="⚠️ آپلود لینک انجام نشد؛ در حال ارسال مستقیم فایل به‌صورت بخش‌بخش...",
+                )
+                _track_message(job.context, notice.message_id)
+            await send_zip_as_stealth_parts(job, zip_path)
             await _set_progress(
-                job,
-                100,
-                "✅ آپلود لینک انجام نشد؛ فایل به‌صورت مستقیم ارسال شد.",
+                job, 100, "✅ آپلود لینک انجام نشد؛ فایل به‌صورت مستقیم ارسال شد."
             )
             return
 
-        encrypted = encrypt(extract_variable(cdn_url), CRYPT_PASS)
-        await _set_progress(job, 92, "✅ خروجی آماده است؛ در حال ارسال...")
-        await _deliver_result(job, encrypted)
+        await _set_progress(job, 92, "✅ خروجی آماده است؛ در حال ارسال لینک...")
+        await _deliver_link_result(job, cdn_url)
         await _set_progress(job, 100, "✅ export کامل شد.")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - آخرین خط دفاعی برای هر export
+        logger.exception("پردازش export %s با خطا مواجه شد: %s", job.job_id, exc)
+        with contextlib.suppress(Exception):
+            failure = await job.context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"❌ پردازش «{job.label}» با خطا متوقف شد.\n"
+                    f"شناسهٔ درخواست: {job.job_id}\n"
+                    "ربات همچنان فعال است؛ لطفاً دوباره تلاش کنید یا با /status وضعیت را بررسی کنید."
+                ),
+            )
+            _track_message(job.context, failure.message_id)
     finally:
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -856,26 +963,53 @@ def admin_only(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[A
     return wrapper
 
 
+def _sorted_channels(channels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(channels, key=lambda c: (c.get("title") or "").casefold())
+
+
 def _channel_keyboard(
-    channels: list[dict[str, Any]], selected_ids: set[int]
+    channels: list[dict[str, Any]], selected_ids: set[int], page: int
 ) -> InlineKeyboardMarkup:
+    """صفحه‌بندی می‌کند تا فهرست کانال‌ها هرچقدر هم زیاد باشد شلوغ و بی‌نظم نشود."""
+    total = len(channels)
+    total_pages = max(1, math.ceil(total / CHANNELS_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * CHANNELS_PER_PAGE
+    page_channels = channels[start : start + CHANNELS_PER_PAGE]
+
     rows = [
         [
             InlineKeyboardButton(
-                f"{'☑' if int(channel['id']) in selected_ids else '☐'} {channel['title'][:38]}",
+                f"{'✅' if int(channel['id']) in selected_ids else '▫️'} {channel['title'][:36]}",
                 callback_data=f"toggle:{channel['id']}",
             )
         ]
-        for channel in channels
+        for channel in page_channels
     ]
+
+    if total_pages > 1:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "◀ قبلی" if page > 0 else "·",
+                    callback_data=f"page:{page - 1}" if page > 0 else "noop",
+                ),
+                InlineKeyboardButton(f"صفحه {page + 1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton(
+                    "بعدی ▶" if page < total_pages - 1 else "·",
+                    callback_data=f"page:{page + 1}" if page < total_pages - 1 else "noop",
+                ),
+            ]
+        )
+
     rows.append(
         [
-            InlineKeyboardButton("انتخاب همه", callback_data="select:all"),
-            InlineKeyboardButton("پاک‌کردن انتخاب", callback_data="select:none"),
+            InlineKeyboardButton(f"✅ انتخاب همه ({total})", callback_data="select:all"),
+            InlineKeyboardButton("🗑 پاک‌کردن انتخاب", callback_data="select:none"),
         ]
     )
     rows.append(
-        [InlineKeyboardButton(f"ادامه با {len(selected_ids)} کانال", callback_data="confirm:selected")]
+        [InlineKeyboardButton(f"▶️ ادامه با {len(selected_ids)} کانال", callback_data="confirm:selected")]
     )
     return InlineKeyboardMarkup(rows)
 
@@ -883,22 +1017,26 @@ def _channel_keyboard(
 async def _send_channel_selector(
     context: ContextTypes.DEFAULT_TYPE, old_message_id: Optional[int] = None
 ) -> Optional[int]:
-    channels = await get_channels()
+    channels = _sorted_channels(await get_channels())
     if not channels:
         return None
     selected_ids = set(context.user_data.get("selected_channel_ids", set()))
+    total_pages = max(1, math.ceil(len(channels) / CHANNELS_PER_PAGE))
+    page = max(0, min(int(context.user_data.get("channel_page", 0)), total_pages - 1))
+    context.user_data["channel_page"] = page
     if old_message_id:
         with contextlib.suppress(Exception):
             await context.bot.delete_message(chat_id=ADMIN_ID, message_id=old_message_id)
     caption = (
-        "کانال‌های موردنظر را انتخاب کنید:\n"
-        f"☑ انتخاب‌شده: {len(selected_ids)} از {len(channels)}\n"
-        "بعد روی «ادامه» بزنید."
+        "📡 کانال‌های موردنظر را انتخاب کنید:\n"
+        f"✅ انتخاب‌شده: {len(selected_ids)} از {len(channels)}\n"
+        f"📄 صفحه {page + 1} از {total_pages}\n"
+        "در پایان روی «ادامه» بزنید."
     )
     message = await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=caption,
-        reply_markup=_channel_keyboard(channels, selected_ids),
+        reply_markup=_channel_keyboard(channels, selected_ids, page),
     )
     return message.message_id
 
@@ -922,6 +1060,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _track_message(context, message.message_id)
         return
     context.user_data["selected_channel_ids"] = set()
+    context.user_data["channel_page"] = 0
     message_id = await _send_channel_selector(context)
     if message_id:
         context.application.bot_data["current_card_msg_id"] = message_id
@@ -948,14 +1087,31 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     channels = await get_channels()
     if not channels:
         channels = await refresh_channels()
-    text = (
-        "کانال‌های ذخیره‌شده:\n\n"
-        + "\n".join(f"• {channel['title']}" for channel in channels)
-        if channels
-        else "فهرست کانال‌ها خالی است. برای دریافت دوباره /refresh را بزنید."
-    )
-    message = await update.message.reply_text(text)
-    _track_message(context, message.message_id)
+    if not channels:
+        message = await update.message.reply_text(
+            "فهرست کانال‌ها خالی است. برای دریافت دوباره /refresh را بزنید."
+        )
+        _track_message(context, message.message_id)
+        return
+
+    channels = _sorted_channels(channels)
+    lines = [
+        f"{index}. {channel['title']}"
+        + (f" — @{channel['username']}" if channel.get("username") else "")
+        for index, channel in enumerate(channels, start=1)
+    ]
+    # پیام‌ها را به‌صورت تکه‌تکه ارسال می‌کنیم تا با فهرست‌های خیلی بزرگ به سقف
+    # طول پیام بله/تلگرام برخورد نکنیم و ارسال با خطا متوقف نشود.
+    chunk = f"📋 کانال‌های ذخیره‌شده ({len(channels)} مورد):\n\n"
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            message = await update.message.reply_text(chunk.rstrip())
+            _track_message(context, message.message_id)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        message = await update.message.reply_text(chunk.rstrip())
+        _track_message(context, message.message_id)
 
 
 @admin_only
@@ -963,16 +1119,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_message(context, update.message.message_id)
     message = await update.message.reply_text(
         "راهنمای دستورها\n\n"
-        "/start — انتخاب هم‌زمان چند کانال با دکمه\n"
-        "/list — نمایش فهرست کانال‌های ذخیره‌شده\n"
+        "/start — انتخاب کانال‌ها (صفحه‌بندی‌شده) → تعداد پیام → روش تحویل\n"
+        "   روش تحویل: 🔗 آپلود و دریافت لینک، یا 📦 ارسال مستقیم بخش‌بخش\n"
+        "/list — نمایش فهرست مرتب‌شدهٔ کانال‌ها\n"
         "/refresh — همگام‌سازی کانال‌ها و پاک‌کردن آواتارهای قدیمی\n"
-        "/export all — خروجی از همهٔ کانال‌ها\n"
-        "/export نام‌کانال — خروجی از یک یا چند کانال مشخص\n"
-        "/setlimit 100 — سقف حجم ZIP برحسب مگابایت\n"
+        "/export all — خروجی از همهٔ کانال‌ها (روش پیش‌فرض: لینک)\n"
+        "/export نام‌کانال [direct|link] — خروجی از کانال(ها) با روش دلخواه\n"
+        "/setlimit 100 — سقف حجم ZIP برحسب مگابایت (برای روش لینک)\n"
         "/status — وضعیت صف و کانال‌های فعلی\n"
         "/Add 12345 — افزودن کاربر مجاز\n"
         "/j آدرس‌کانال — عضویت در کانال عمومی/خصوصی و دریافت پیام‌های اخیر\n"
-        "/del — پاک‌کردن تک‌تکِ پیام‌های ردیابی‌شدهٔ اخیر",
+        "/del — پاک‌کردن تک‌تکِ پیام‌های ردیابی‌شدهٔ اخیر\n\n"
+        f"ℹ️ در روش «ارسال مستقیم»، فایل در بخش‌های ≤{DIRECT_SEND_CHUNK_MB} مگابایتی "
+        "و با پسوند ظاهری .jpg ارسال می‌شود (محدودیت واقعی بله ۵۰ مگابایت است).",
     )
     _track_message(context, message.message_id)
 
@@ -1027,6 +1186,7 @@ async def _enqueue_job(
     count: int = DEFAULT_MESSAGE_COUNT,
     max_zip_mb: int = DEFAULT_MAX_ZIP_MB,
     max_media_bytes: Optional[int] = None,
+    delivery: str = "link",
 ) -> None:
     if not channels:
         message = await context.bot.send_message(
@@ -1038,21 +1198,29 @@ async def _enqueue_job(
         )
         _track_message(context, message.message_id)
         return
+    # برای ارسال مستقیم نیازی به سقف کوچکِ آپلودِ لینک نیست؛ چون خروجی
+    # خودش بعداً به بخش‌های ≤۴۵ مگابایتی تقسیم می‌شود، فقط یک سقف ایمنی کلی داریم.
+    effective_max_zip_mb = (
+        max(max_zip_mb, DIRECT_SEND_SAFETY_CAP_MB) if delivery == "direct" else max_zip_mb
+    )
     job = ExportJob(
         context=context,
         channels=channels,
         count=count,
-        max_zip_mb=max_zip_mb,
+        max_zip_mb=effective_max_zip_mb,
         max_media_bytes=max_media_bytes if max_media_bytes is not None else DEFAULT_MAX_MEDIA_BYTES,
         label=label,
+        delivery=delivery,
     )
     channel_names = "، ".join(channel["title"] for channel in channels)
+    delivery_label = "📦 ارسال مستقیم بخش‌بخش" if delivery == "direct" else "🔗 آپلود و دریافت لینک"
     request_message = await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=(
             f"📥 درخواست {label} ثبت شد.\n"
             f"کانال‌ها: {channel_names}\n"
             f"محدوده: {count} پیام از هر کانال\n"
+            f"روش تحویل: {delivery_label}\n"
             "دانلود رسانه‌ها به‌صورت هم‌زمان انجام می‌شود."
         ),
     )
@@ -1082,7 +1250,11 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     channels = await get_channels()
     if not channels:
         channels = await refresh_channels()
-    selectors = [token.lstrip("@").casefold() for token in context.args]
+    args = list(context.args)
+    delivery = "link"
+    if args and args[-1].casefold() in ("direct", "link"):
+        delivery = args.pop().casefold()
+    selectors = [token.lstrip("@").casefold() for token in args]
     if not selectors or "all" in selectors:
         selected = channels
     else:
@@ -1096,6 +1268,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context,
         selected,
         label="export",
+        delivery=delivery,
     )
 
 
@@ -1213,6 +1386,15 @@ async def scheduled_state_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.to_thread(backup_state)
 
 
+def _delivery_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔗 آپلود و دریافت لینک", callback_data="deliver:link")],
+            [InlineKeyboardButton("📦 ارسال مستقیم توسط ربات", callback_data="deliver:direct")],
+        ]
+    )
+
+
 @admin_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_message(context, update.message.message_id)
@@ -1224,25 +1406,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         count = max(1, int(text))
     except ValueError:
-        return
-    pending_channels = context.user_data.pop("pending_channels", [])
-    context.user_data["state"] = None
-    if pending_channels:
-        await _enqueue_job(
-            context,
-            pending_channels,
-            label="export",
-            count=count,
-            max_zip_mb=int(
-                context.application.bot_data.get("max_zip_mb", DEFAULT_MAX_ZIP_MB)
-            ),
-            max_media_bytes=DEFAULT_MAX_MEDIA_BYTES,
+        message = await update.message.reply_text(
+            "لطفاً فقط یک عدد مثبت بفرستید؛ مثلاً 30."
         )
-    else:
+        _track_message(context, message.message_id)
+        return
+    pending_channels = context.user_data.get("pending_channels", [])
+    if not pending_channels:
+        context.user_data["state"] = None
         message = await update.message.reply_text(
             "انتخاب کانال منقضی شده است. دوباره /start را بزنید."
         )
         _track_message(context, message.message_id)
+        return
+    context.user_data["pending_count"] = count
+    context.user_data["state"] = "waiting_deliver"
+    prompt = await update.message.reply_text(
+        "روش تحویل خروجی را انتخاب کنید:\n\n"
+        "🔗 آپلود و دریافت لینک — فایل روی سرور آپلود و لینک مستقیمِ آن برایتان ارسال می‌شود.\n"
+        f"📦 ارسال مستقیم — فایل در همین چت ارسال می‌شود (در صورت نیاز، بخش‌های ≤{DIRECT_SEND_CHUNK_MB} مگابایتی).",
+        reply_markup=_delivery_choice_keyboard(),
+    )
+    _track_message(context, prompt.message_id)
 
 
 @admin_only
@@ -1250,6 +1435,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+    if data == "noop":
+        return
     if data.startswith("cancel:"):
         job_id = data.split(":", 1)[1]
         cancelled = await _queue(context.application).cancel_job(job_id)
@@ -1262,6 +1449,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
         _track_message(context, message.message_id)
+    elif data.startswith("page:"):
+        try:
+            context.user_data["channel_page"] = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        new_id = await _send_channel_selector(context, query.message.message_id)
+        if new_id:
+            context.application.bot_data["current_card_msg_id"] = new_id
     elif data.startswith("toggle:"):
         channels = await get_channels()
         channel_id = int(data.split(":", 1)[1])
@@ -1313,9 +1508,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
         _track_message(context, prompt.message_id)
+    elif data.startswith("deliver:"):
+        if context.user_data.get("state") != "waiting_deliver":
+            await query.answer("این گزینه دیگر معتبر نیست.", show_alert=True)
+            return
+        method = data.split(":", 1)[1]
+        if method not in ("link", "direct"):
+            return
+        pending_channels = context.user_data.pop("pending_channels", [])
+        count = int(context.user_data.pop("pending_count", DEFAULT_MESSAGE_COUNT))
+        context.user_data["state"] = None
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(
+                chat_id=ADMIN_ID, message_id=query.message.message_id
+            )
+        if not pending_channels:
+            message = await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="انتخاب کانال منقضی شده است. دوباره /start را بزنید.",
+            )
+            _track_message(context, message.message_id)
+            return
+        await _enqueue_job(
+            context,
+            pending_channels,
+            label="export",
+            count=count,
+            delivery=method,
+            max_zip_mb=int(
+                context.application.bot_data.get("max_zip_mb", DEFAULT_MAX_ZIP_MB)
+            ),
+            max_media_bytes=DEFAULT_MAX_MEDIA_BYTES,
+        )
 
 
-async def main() -> None:
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """هندلر خطای سراسری python-telegram-bot: هر استثنای پیش‌بینی‌نشده در پردازش
+    یک آپدیت را فقط لاگ می‌کند و به ادمین اطلاع می‌دهد، بدون این‌که پردازش
+    آپدیت‌های بعدی یا اصلِ ربات را متوقف کند."""
+    logger.error("خطای پیش‌بینی‌نشده هنگام پردازش آپدیت: %s", update, exc_info=context.error)
+    with contextlib.suppress(Exception):
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text="⚠️ یک خطای غیرمنتظره رخ داد اما ربات بدون مشکل به کار خود ادامه می‌دهد.",
+        )
+
+
+async def _run_bot() -> None:
     global userbot
     cleanup_old_temp_files()
     _ensure_data_dirs()
@@ -1350,6 +1589,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("del", cmd_delete))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(auto_delete_messages, interval=60, first=60)
     app.job_queue.run_repeating(
@@ -1373,5 +1613,34 @@ async def main() -> None:
         await userbot.disconnect()
 
 
+async def main() -> None:
+    """سوپروایزر: کل ربات (شامل اتصال Telethon و Application بله) را در صورت
+    هر خطای پیش‌بینی‌نشده، به‌طور خودکار و با فاصلهٔ زمانی فزاینده (backoff)
+    از نو راه‌اندازی می‌کند. این تنها راه دفاعی است که وقتی به اینترنت
+    بین‌الملل/هاست Railway دسترسی نیست، ربات را زنده نگه می‌دارد."""
+    backoff_seconds = 5
+    max_backoff_seconds = 120
+    while True:
+        started_at = time.monotonic()
+        try:
+            await _run_bot()
+            logger.info("_run_bot خارج شد بدون خطا؛ ربات دوباره راه‌اندازی می‌شود.")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("خاموش‌شدن دستی/برنامه‌ریزی‌شده دریافت شد؛ سوپروایزر متوقف می‌شود.")
+            raise
+        except Exception:
+            logger.exception("ربات با خطا متوقف شد؛ راه‌اندازی مجدد خودکار...")
+        # اگر ربات مدتی طولانی (بیش از ۱۰ دقیقه) پایدار اجرا شده بود، تأخیر
+        # را ریست می‌کنیم تا قطعی‌های موقتی باعث انتظار طولانی نشوند.
+        if time.monotonic() - started_at > 600:
+            backoff_seconds = 5
+        logger.info("راه‌اندازی مجدد در %s ثانیهٔ دیگر...", backoff_seconds)
+        await asyncio.sleep(backoff_seconds)
+        backoff_seconds = min(backoff_seconds * 2, max_backoff_seconds)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
