@@ -47,7 +47,7 @@ from telethon.tl.types import (
     MessageMediaPhoto,
     PeerChannel,
 )
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -528,8 +528,7 @@ async def _send_part_with_retry(
             with part_path.open("rb") as fh:
                 await job.context.bot.send_document(
                     chat_id=ADMIN_ID,
-                    document=fh,
-                    filename=part_path.name,
+                    document=InputFile(fh, filename=part_path.name),
                 )
             return
         except Exception as exc:  # noqa: BLE001 - می‌خواهیم هر خطایی را retry کنیم

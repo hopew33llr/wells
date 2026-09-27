@@ -1,505 +1,595 @@
-"""تولید خروجی HTML چندکاناله با ظاهر شبیه اپ تلگرام (دسکتاپ) + تم futuristic.
-
-خروجی کاملاً آفلاین و تک‌فایلی است (بدون هیچ منبع خارجی)، شامل:
-- ستون کناری با فهرست کانال‌ها (مثل لیست چت‌های تلگرام) برای پرش سریع بین کانال‌ها
-- نمای پیام‌ها با حباب‌های شبیه تلگرام
-- جست‌وجو و فیلتر نوع پیام + جست‌وجوی کانال در ستون کناری
-- لایت‌باکس تصاویر، دکمهٔ بازگشت به بالا، و طراحی واکنش‌گرا برای موبایل
-"""
-
 from __future__ import annotations
-
-import html
-import os
+import html, os
 from datetime import datetime, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+    TEHRAN = ZoneInfo("Asia/Tehran")
+except Exception:
+    TEHRAN = timezone.utc
 
-TEHRAN = ZoneInfo("Asia/Tehran")
 MIME_MAP = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
-    ".mkv": "video/x-matroska", ".ogg": "audio/ogg", ".mp3": "audio/mpeg",
-    ".m4a": "audio/mp4", ".wav": "audio/wav", ".pdf": "application/pdf",
-    ".zip": "application/zip", ".rar": "application/x-rar-compressed",
-    ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".ppt": "application/vnd.ms-powerpoint", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ".txt": "text/plain",
+    ".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",".gif":"image/gif",
+    ".webp":"image/webp",".bmp":"image/bmp",".mp4":"video/mp4",".mov":"video/quicktime",
+    ".webm":"video/webm",".mkv":"video/x-matroska",".ogg":"audio/ogg",".mp3":"audio/mpeg",
+    ".m4a":"audio/mp4",".wav":"audio/wav",".pdf":"application/pdf",".zip":"application/zip",
 }
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
-AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".oga"}
+IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".webp",".bmp"}
+VIDEO_EXTS = {".mp4",".mov",".webm",".mkv",".avi"}
+AUDIO_EXTS = {".mp3",".m4a",".aac",".flac",".wav",".ogg",".oga"}
 FILE_ICONS = {
-    ".pdf": "PDF", ".doc": "DOC", ".docx": "DOC", ".xls": "XLS",
-    ".xlsx": "XLS", ".ppt": "PPT", ".pptx": "PPT", ".zip": "ZIP",
-    ".rar": "RAR", ".txt": "TXT",
+    ".pdf":"PDF",".doc":"DOC",".docx":"DOC",".xls":"XLS",".xlsx":"XLS",
+    ".ppt":"PPT",".pptx":"PPT",".zip":"ZIP",".rar":"RAR",".txt":"TXT",
 }
-WEEKDAYS_FA = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه"]
-MONTHS_FA = [
-    "ژانویه", "فوریه", "مارس", "آوریل", "مه", "ژوئن",
-    "ژوئیه", "اوت", "سپتامبر", "اکتبر", "نوامبر", "دسامبر",
-]
+MONTHS_FA = ["ژانویه","فوریه","مارس","آوریل","مه","ژوئن","ژوئیه","اوت","سپتامبر","اکتبر","نوامبر","دسامبر"]
 
+def _local(v):
+    if not isinstance(v, datetime): return None
+    if v.tzinfo is None: v = v.replace(tzinfo=timezone.utc)
+    try: return v.astimezone(TEHRAN)
+    except Exception: return v
 
-def _mime(path: str) -> str:
-    return MIME_MAP.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+def _fmt_time(v):
+    d = _local(v)
+    return f"{d:%H:%M}" if d else ""
 
+def _day_key(v):
+    d = _local(v)
+    return f"{d.year}-{d.month:02d}-{d.day:02d}" if d else "x"
 
-def _local(value: object) -> Optional[datetime]:
-    if not isinstance(value, datetime):
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(TEHRAN)
-
-
-def _format_time(value: object) -> str:
-    local = _local(value)
-    if not local:
-        return html.escape(str(value or ""))
-    return f"{local:%H:%M}"
-
-
-def _day_key(value: object) -> str:
-    local = _local(value)
-    if not local:
-        return "نامشخص"
-    return f"{local.year:04d}-{local.month:02d}-{local.day:02d}"
-
-
-def _day_label(value: object) -> str:
-    local = _local(value)
-    if not local:
-        return "نامشخص"
+def _day_label(v):
+    d = _local(v)
+    if not d: return "نامشخص"
     today = datetime.now(TEHRAN).date()
-    delta = (local.date() - today).days
-    if delta == 0:
-        return "امروز"
-    if delta == -1:
-        return "دیروز"
-    return f"{local.day} {MONTHS_FA[local.month - 1]} {local.year}"
+    delta = (d.date() - today).days
+    if delta == 0: return "امروز"
+    if delta == -1: return "دیروز"
+    return f"{d.day} {MONTHS_FA[d.month-1]} {d.year}"
 
+def _fmt_size(b):
+    if not b: return ""
+    if b < 1048576: return f"{b/1024:.1f} KB"
+    if b < 1073741824: return f"{b/1048576:.1f} MB"
+    return f"{b/1073741824:.1f} GB"
 
-def _format_size(value: int) -> str:
-    if not value:
-        return ""
-    if value < 1024 * 1024:
-        return f"{value / 1024:.1f} KB"
-    if value < 1024 * 1024 * 1024:
-        return f"{value / (1024 * 1024):.1f} MB"
-    return f"{value / (1024 * 1024 * 1024):.1f} GB"
+def _mime(p):
+    return MIME_MAP.get(os.path.splitext(p)[1].lower(), "application/octet-stream")
 
-
-def _render_media(message: dict) -> str:
-    path = message.get("media_path")
+def _media(msg):
+    path = msg.get("media_path")
     if not path or not os.path.exists(path):
-        if message.get("media_skipped"):
-            return '<div class="skipped">⚠️ فایل بزرگ‌تر از سقف مجاز است</div>'
+        if msg.get("media_skipped"):
+            return '<p class="skipped">⚠️ فایل بزرگ‌تر از سقف مجاز است</p>'
         return ""
-    rel = html.escape(message.get("media_rel_path") or f"media/{os.path.basename(path)}")
-    media_type = message.get("media_type", "")
-    extension = os.path.splitext(path)[1].lower()
-    if media_type == "image" or extension in IMAGE_EXTS:
-        return f'<a class="bubble-media image-link" href="{rel}" target="_blank"><img class="media-image" src="{rel}" loading="lazy" alt=""></a>'
-    if media_type == "video" or extension in VIDEO_EXTS:
-        poster = message.get("media_poster", "")
-        poster_attr = f' poster="{html.escape(poster)}"' if poster else ""
-        return (
-            f'<div class="bubble-media"><video class="media-video" controls preload="metadata"{poster_attr}>'
-            f'<source src="{rel}" type="{_mime(path)}">مرورگر شما ویدئو را پشتیبانی نمی‌کند.</video></div>'
-        )
-    if media_type == "audio" or extension in AUDIO_EXTS:
-        name = html.escape(message.get("media_name") or os.path.basename(path))
-        return f'<div class="audio"><div class="media-label">🎧 {name}</div><audio controls preload="metadata" src="{rel}"></audio></div>'
-    name = html.escape(message.get("media_name") or os.path.basename(path))
-    label = FILE_ICONS.get(extension, "FILE")
-    size = _format_size(int(message.get("media_size", 0) or os.path.getsize(path)))
+    rel = html.escape(msg.get("media_rel_path") or f"media/{os.path.basename(path)}")
+    mt = msg.get("media_type","")
+    ext = os.path.splitext(path)[1].lower()
+    if mt=="image" or ext in IMAGE_EXTS:
+        return f'<a href="{rel}" target="_blank"><img class="post-img" src="{rel}" loading="lazy" alt=""></a>'
+    if mt=="video" or ext in VIDEO_EXTS:
+        return f'<video class="post-video" controls preload="metadata"><source src="{rel}" type="{_mime(path)}"></video>'
+    if mt=="audio" or ext in AUDIO_EXTS:
+        name = html.escape(msg.get("media_name") or os.path.basename(path))
+        return f'<div class="post-audio"><span>🎧 {name}</span><audio controls src="{rel}"></audio></div>'
+    name = html.escape(msg.get("media_name") or os.path.basename(path))
+    lbl = FILE_ICONS.get(ext,"FILE")
+    size = _fmt_size(int(msg.get("media_size",0) or os.path.getsize(path)))
+    return (f'<a class="post-doc" href="{rel}" download="{name}">'
+            f'<span class="doc-icon">{lbl}</span>'
+            f'<span class="doc-info"><b>{name}</b><small>{size}</small></span>'
+            f'<span class="doc-dl">⭳</span></a>')
+
+def _render_msg(msg, idx):
+    text = html.escape(msg.get("text","") or "").replace("\n","<br>")
+    media = _media(msg)
+    if not media and not text:
+        text = '<span class="empty-msg">پیام بدون محتوا</span>'
+    views = int(msg.get("views",0) or 0)
+    v_html = f'<span class="stat">👁 {views:,}</span>' if views else ""
+    reacts = "".join(
+        f'<span class="react">{html.escape(str(r.get("emoji","")))} {r.get("count",0)}</span>'
+        for r in msg.get("reactions",[])
+    )
+    mt = msg.get("media_type","") or "متن"
     return (
-        f'<a class="document" href="{rel}" download="{name}"><span class="file-icon">{label}</span>'
-        f'<span class="file-copy"><b>{name}</b><small>{size}</small></span><span class="download">⭳</span></a>'
+        f'<article class="post" data-s="{html.escape((msg.get("text","") or "").casefold())}" '
+        f'data-t="{html.escape(str(mt))}" id="m{idx}">'
+        f'{media}'
+        f'{"<p class=post-text>"+text+"</p>" if text else ""}'
+        f'<footer class="post-foot">'
+        f'<span class="reacts">{reacts}</span>'
+        f'<span class="stats">{v_html}<span class="time">{_fmt_time(msg.get("date"))} <span class="ticks">✓✓</span></span></span>'
+        f'</footer></article>'
     )
 
-
-def _render_message(message: dict, index: int) -> str:
-    text = html.escape(message.get("text", "") or "").replace("\n", "<br>")
-    reactions = "".join(
-        f'<span class="reaction">{html.escape(str(item.get("emoji", "")))} {item.get("count", 0)}</span>'
-        for item in message.get("reactions", [])
-    )
-    media_html = _render_media(message)
-    has_media = bool(media_html) and "skipped" not in media_html
-    text_html = f'<div class="bubble-text">{text}</div>' if text else ""
-    if not media_html and not text:
-        text_html = '<div class="bubble-text empty">رسانه یا متن قابل نمایش نیست</div>'
-    type_name = "متن" if not message.get("media_type") else message.get("media_type")
-    views = int(message.get("views", 0) or 0)
-    views_html = f'<span class="views">👁 {views:,}</span>' if views else ""
-    bubble_class = "bubble media-bubble" if has_media and not text else "bubble"
+def _render_channel(ch, ci):
+    name = html.escape(ch.get("name",""))
+    uname = html.escape(ch.get("username","") or "")
+    av = ch.get("avatar_rel_path","")
+    av_html = (f'<img class="ch-av" src="{html.escape(av)}" alt="">' if av
+               else f'<div class="ch-av fallback">{html.escape((name or "?")[:1])}</div>')
+    msgs = ch.get("messages",[])
+    rows, last = [], None
+    for mi, m in enumerate(msgs):
+        dk = _day_key(m.get("date"))
+        if dk != last:
+            rows.append(f'<div class="day-div" data-s="" data-t="__"><span>{_day_label(m.get("date"))}</span></div>')
+            last = dk
+        rows.append(_render_msg(m, ci*100000+mi))
+    feed = "".join(rows) or '<p class="no-posts">پیامی برای نمایش نیست.</p>'
+    sub = f'@{uname}' if uname else f'{len(msgs)} پیام'
     return (
-        f'<div class="msg-row" data-search="{html.escape((message.get("text", "") or "").casefold())}" '
-        f'data-type="{html.escape(str(type_name))}" id="message-{index}">'
-        f'<div class="{bubble_class}">'
-        f'{media_html}{text_html}'
-        f'<div class="meta"><span class="reactions">{reactions}</span>{views_html}'
-        f'<span class="time">{_format_time(message.get("date"))}<span class="tick">✓✓</span></span></div>'
-        f'</div></div>'
+        f'<section class="ch-section" id="ch{ci}" data-ch="{name}">'
+        f'<div class="ch-head">'
+        f'{av_html}'
+        f'<div class="ch-head-info"><h2>{name}</h2><p>{sub}</p></div>'
+        f'</div>'
+        f'<div class="ch-feed">{feed}</div>'
+        f'</section>'
     )
 
-
-def _render_channel(channel: dict, index: int) -> str:
-    name = html.escape(channel.get("name", ""))
-    username = html.escape(channel.get("username", ""))
-    avatar = channel.get("avatar_rel_path", "")
-    avatar_html = (
-        f'<img class="avatar" src="{html.escape(avatar)}" alt="">'
-        if avatar
-        else f'<div class="avatar fallback">{html.escape((name or "?")[:1])}</div>'
-    )
-    messages = channel.get("messages", [])
-
-    rows: list[str] = []
-    last_day: Optional[str] = None
-    for message_index, message in enumerate(messages):
-        day_key = _day_key(message.get("date"))
-        if day_key != last_day:
-            rows.append(
-                f'<div class="day-sep" data-search="" data-type="__day__">'
-                f'<span>{_day_label(message.get("date"))}</span></div>'
-            )
-            last_day = day_key
-        rows.append(_render_message(message, index * 100000 + message_index))
-    messages_html = "".join(rows) or "<div class=\"empty-state small\">پیامی برای این کانال نیست.</div>"
-
-    handle = f'<span>@{username}</span> · ' if username else ""
+def _side_item(ch, ci):
+    name = html.escape(ch.get("name","") or "بدون‌نام")
+    uname = html.escape(ch.get("username","") or "")
+    av = ch.get("avatar_rel_path","")
+    av_html = (f'<img class="s-av" src="{html.escape(av)}" alt="">' if av
+               else f'<div class="s-av fallback">{html.escape((name or "?")[:1])}</div>')
+    cnt = len(ch.get("messages",[]))
+    sub = f'@{uname}' if uname else f'{cnt} پیام'
+    sk = html.escape(f'{name} {uname}'.casefold())
     return (
-        f'<section class="channel" data-channel="{name}" id="channel-{index}">'
-        f'<header class="chat-header">{avatar_html}<div class="chat-header-copy"><h2>{name}</h2>'
-        f'<p>{handle}{len(messages)} پیام</p></div>'
-        f'<a class="channel-link" href="#channel-{index}" aria-label="لینک کانال">#</a></header>'
-        f'<div class="feed">{messages_html}</div></section>'
-    )
-
-
-def _render_sidebar_item(channel: dict, index: int) -> str:
-    name = html.escape(channel.get("name", "") or "بدون‌نام")
-    username = channel.get("username", "") or ""
-    avatar = channel.get("avatar_rel_path", "")
-    avatar_html = (
-        f'<img class="side-avatar" src="{html.escape(avatar)}" alt="">'
-        if avatar
-        else f'<div class="side-avatar fallback">{html.escape((name or "?")[:1])}</div>'
-    )
-    count = len(channel.get("messages", []))
-    subtitle = f"@{html.escape(username)}" if username else f"{count} پیام"
-    search_key = html.escape(f"{name} {username}".casefold())
-    return (
-        f'<a class="side-item" href="#channel-{index}" data-target="channel-{index}" data-search="{search_key}">'
-        f'{avatar_html}'
-        f'<span class="side-copy"><b>{name}</b><small>{subtitle}</small></span>'
-        f'<span class="side-count">{count}</span>'
+        f'<a class="s-item" href="#ch{ci}" data-target="ch{ci}" data-sk="{sk}">'
+        f'{av_html}'
+        f'<span class="s-info"><b>{name}</b><small>{sub}</small></span>'
+        f'<span class="s-cnt">{cnt}</span>'
         f'</a>'
     )
 
-
-def generate_html(
-    channel_name: Optional[str] = None,
-    channel_avatar_path: Optional[str] = None,
-    messages: Optional[list] = None,
-    msg_count: int = 0,
-    *,
-    channels: Optional[list[dict]] = None,
-) -> str:
+def generate_html(channel_name=None, channel_avatar_path=None, messages=None,
+                  msg_count=0, *, channels=None):
     if channels is None:
-        channels = [{
-            "name": channel_name or "",
-            "avatar_rel_path": "media/avatar.jpg" if channel_avatar_path else "",
-            "messages": messages or [],
-        }]
-    title = html.escape(channel_name or (channels[0].get("name", "") if channels else "Archive"))
-    channel_html = "".join(_render_channel(channel, index) for index, channel in enumerate(channels))
-    sidebar_html = "".join(_render_sidebar_item(channel, index) for index, channel in enumerate(channels))
-    total_messages = sum(len(channel.get("messages", [])) for channel in channels)
+        channels = [{"name": channel_name or "", "avatar_rel_path": "media/avatar.jpg" if channel_avatar_path else "", "messages": messages or []}]
+    title = html.escape(channel_name or (channels[0].get("name","") if channels else "Archive"))
+    ch_html = "".join(_render_channel(ch, i) for i, ch in enumerate(channels))
+    s_html  = "".join(_side_item(ch, i) for i, ch in enumerate(channels))
+    total   = sum(len(ch.get("messages",[])) for ch in channels)
+    nc = len(channels)
+
     return f"""<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <title>{title}</title>
 <style>
-:root{{
-  --bg:#05070b;--bg-grid:#ffffff08;--panel:#0c111a;--panel-2:#111826;--in-bubble:#101825;
-  --line:#1b2434;--text:#e8edf5;--muted:#7e8ca1;
-  --accent:#22d3ee;--accent-2:#3b82f6;--accent-soft:#22d3ee22;
-  --tick:#3fd0a0;--radius:15px;--shadow:0 8px 26px #00000060;
-  --glow:0 0 0 1px #22d3ee2e, 0 0 24px #22d3ee1f;
+*, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0 }}
+:root {{
+  --c-bg:       #0d1117;
+  --c-surface:  #161b22;
+  --c-surface2: #1c2330;
+  --c-border:   #21262d;
+  --c-text:     #e6edf3;
+  --c-muted:    #7d8590;
+  --c-accent:   #00bcd4;
+  --c-accent2:  #1a7bb5;
+  --c-green:    #3fb950;
+  --c-bubble:   #172130;
+  --r-sm:       10px;
+  --r-md:       14px;
+  --r-lg:       18px;
+  --sidebar-w:  288px;
+  --safe-top:   env(safe-area-inset-top,0px);
+  --safe-bot:   env(safe-area-inset-bottom,0px);
 }}
-*{{box-sizing:border-box}}
-html{{scroll-behavior:smooth}}
-::-webkit-scrollbar{{width:9px;height:9px}}
-::-webkit-scrollbar-track{{background:transparent}}
-::-webkit-scrollbar-thumb{{background:#1e2a3c;border-radius:8px}}
-::-webkit-scrollbar-thumb:hover{{background:var(--accent-2)}}
-body{{
-  margin:0;height:100vh;color:var(--text);
-  font-family:Vazirmatn,"Segoe UI",Tahoma,sans-serif;
-  background-color:var(--bg);
-  background-image:
-    radial-gradient(circle at 12% 0%,#0d2230 0,transparent 42%),
-    radial-gradient(circle at 100% 100%,#0a1c2c 0,transparent 40%),
-    repeating-linear-gradient(90deg,var(--bg-grid) 0 1px,transparent 1px 64px),
-    repeating-linear-gradient(0deg,var(--bg-grid) 0 1px,transparent 1px 64px);
-  overflow:hidden;
+html, body {{ height: 100%; background: var(--c-bg); color: var(--c-text);
+  font-family: Vazirmatn, "Segoe UI", Tahoma, sans-serif; overflow: hidden; }}
+::-webkit-scrollbar {{ width: 6px }}
+::-webkit-scrollbar-track {{ background: transparent }}
+::-webkit-scrollbar-thumb {{ background: var(--c-border); border-radius: 6px }}
+::-webkit-scrollbar-thumb:hover {{ background: var(--c-muted) }}
+
+/* ── Layout ── */
+.shell {{ display: flex; height: 100vh; height: 100dvh; }}
+
+/* ── Sidebar ── */
+.sidebar {{
+  width: var(--sidebar-w); flex: none;
+  background: var(--c-surface);
+  border-inline-start: 1px solid var(--c-border);
+  display: flex; flex-direction: column;
+  z-index: 200;
 }}
-.app-shell{{display:flex;height:100vh;max-width:1400px;margin:0 auto;border-inline:1px solid var(--line)}}
-
-.sidebar{{width:300px;flex:none;background:var(--panel);border-left:1px solid var(--line);
-  display:flex;flex-direction:column;min-height:0}}
-.side-head{{padding:16px 14px 12px;border-bottom:1px solid var(--line);flex:none}}
-.brand{{display:flex;align-items:center;gap:12px;margin-bottom:12px}}
-.brand-mark{{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
-  background:linear-gradient(145deg,var(--accent),var(--accent-2));font-size:18px;font-weight:900;
-  color:#03141c;flex:none;box-shadow:var(--glow)}}
-.brand h1{{margin:0;font-size:15px;letter-spacing:-.2px}}
-.brand small{{display:block;color:var(--muted);font-size:11px;margin-top:2px}}
-.side-search-wrap{{position:relative}}
-.side-search{{width:100%;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;
-  color:var(--text);padding:9px 34px 9px 12px;outline:none;font-size:12.5px;font-family:inherit;transition:.2s}}
-.side-search:focus{{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}}
-.side-search-wrap .search-icon{{position:absolute;right:11px;top:8px;color:var(--muted);font-size:14px}}
-
-.side-list{{flex:1;overflow-y:auto;padding:6px}}
-.side-item{{display:flex;align-items:center;gap:10px;padding:9px 8px;border-radius:11px;text-decoration:none;
-  color:var(--text);margin-bottom:2px;transition:.15s;border:1px solid transparent}}
-.side-item:hover{{background:var(--panel-2)}}
-.side-item.active{{background:var(--panel-2);border-color:var(--accent-soft);box-shadow:inset 2px 0 0 var(--accent)}}
-.side-item.filtered-out{{display:none}}
-.side-avatar{{width:38px;height:38px;border-radius:11px;object-fit:cover;flex:none;border:1px solid #ffffff14}}
-.side-avatar.fallback{{display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent-2));
-  font-size:16px;font-weight:800;color:#03141c}}
-.side-copy{{min-width:0;flex:1}}
-.side-copy b{{display:block;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.side-copy small{{display:block;color:var(--muted);font-size:10.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.side-count{{color:var(--muted);font-size:10px;background:var(--panel);border:1px solid var(--line);
-  border-radius:10px;padding:2px 7px;flex:none}}
-
-.content{{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}}
-.topbar{{flex:none;position:relative;z-index:20;padding:12px clamp(14px,3vw,32px);background:var(--panel);
-  border-bottom:1px solid var(--line);box-shadow:var(--shadow)}}
-.topbar::after{{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
-  background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.6}}
-.topbar-inner{{display:flex;align-items:center;gap:14px;justify-content:space-between}}
-.count{{color:var(--muted);font-size:12px;white-space:nowrap}}
-.menu-toggle{{display:none;background:var(--panel-2);border:1px solid var(--line);color:var(--accent);
-  width:34px;height:34px;border-radius:9px;font-size:15px;cursor:pointer;flex:none}}
-
-.toolbar{{flex:none;padding:12px clamp(14px,3vw,32px) 0;display:grid;grid-template-columns:1fr auto;gap:10px}}
-.search-wrap{{position:relative}}
-.search{{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:20px;color:var(--text);
-  padding:11px 40px 11px 14px;outline:none;font-size:13px;font-family:inherit;transition:.2s}}
-.search:focus{{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}}
-.search-icon{{position:absolute;right:14px;top:11px;color:var(--muted);font-size:15px}}
-.filters{{display:flex;gap:6px;align-items:center}}
-.filter{{cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--muted);
-  border-radius:16px;padding:9px 12px;font-size:11px;font-family:inherit;transition:.15s}}
-.filter.active,.filter:hover{{background:var(--accent);color:#04141c;border-color:var(--accent)}}
-
-.summary{{flex:none;padding:10px clamp(14px,3vw,32px) 0;color:var(--muted);font-size:11px}}
-.summary strong{{color:var(--accent)}}
-
-.scroll-area{{flex:1;overflow-y:auto;padding:14px clamp(10px,3vw,26px) 30px}}
-.channel{{max-width:760px;margin:18px auto 0}}
-.chat-header{{display:flex;gap:12px;align-items:center;padding:10px 14px;background:var(--panel);
-  border-bottom:1px solid var(--line);border-radius:13px 13px 0 0;position:sticky;top:0;z-index:6;box-shadow:var(--shadow)}}
-.avatar{{width:44px;height:44px;border-radius:13px;object-fit:cover;flex:none;border:1px solid #ffffff14}}
-.avatar.fallback{{display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent-2));
-  font-size:19px;font-weight:800;color:#03141c}}
-.chat-header-copy{{min-width:0;flex:1}}
-.chat-header h2{{font-size:15px;margin:0 0 3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.chat-header p{{margin:0;color:var(--muted);font-size:11.5px}}
-.channel-link{{color:var(--accent);text-decoration:none;font-size:16px;padding:6px 9px;border-radius:8px}}
-.channel-link:hover{{background:var(--panel-2)}}
-
-.feed{{background:var(--bg);padding:14px 8px 22px;display:flex;flex-direction:column;gap:2px;
-  border-radius:0 0 13px 13px;border:1px solid var(--line);border-top:none}}
-
-.day-sep{{display:flex;justify-content:center;margin:14px 0 10px}}
-.day-sep span{{background:var(--panel-2);border:1px solid var(--line);color:var(--muted);font-size:11.5px;
-  padding:5px 14px;border-radius:12px}}
-
-.msg-row{{display:flex;justify-content:flex-end;padding:0 4px;margin:2px 0}}
-.bubble{{
-  position:relative;max-width:74%;background:var(--in-bubble);border:1px solid #ffffff0d;
-  border-radius:var(--radius) var(--radius) 4px var(--radius);
-  padding:7px 10px 6px 8px;box-shadow:0 2px 6px #00000040;transition:box-shadow .15s;
+.s-head {{
+  padding: 14px 12px 10px;
+  border-bottom: 1px solid var(--c-border);
+  flex: none;
+  padding-top: calc(14px + var(--safe-top));
 }}
-.bubble:hover{{box-shadow:0 2px 6px #00000040, 0 0 0 1px var(--accent-soft)}}
-.bubble::after{{
-  content:"";position:absolute;bottom:0;left:-7px;width:14px;height:16px;background:var(--in-bubble);
-  -webkit-mask:radial-gradient(circle at top left,transparent 14px,#000 14.5px);
-  mask:radial-gradient(circle at top left,transparent 14px,#000 14.5px);
+.brand {{ display: flex; align-items: center; gap: 10px; margin-bottom: 12px }}
+.brand-icon {{
+  width: 36px; height: 36px; border-radius: 10px; flex: none;
+  background: linear-gradient(135deg, var(--c-accent), var(--c-accent2));
+  display: grid; place-items: center; font-size: 16px; font-weight: 900; color: #03141c;
 }}
-.bubble-text{{font-size:14.5px;line-height:1.65;word-break:break-word;white-space:pre-wrap;padding:2px 3px 0}}
-.bubble-text.empty{{color:var(--muted);font-style:normal}}
-.bubble-media{{border-radius:9px;overflow:hidden;background:#060a10;margin-bottom:2px}}
-.media-image{{display:block;width:100%;max-height:420px;object-fit:cover;cursor:zoom-in;border-radius:9px}}
-.media-video{{display:block;width:100%;max-height:420px;border-radius:9px;background:#03060a}}
-.media-bubble{{padding-bottom:4px}}
-.audio{{background:var(--panel-2);border-radius:9px;padding:10px;color:var(--muted);font-size:11px;margin:2px 0}}
-.audio audio{{display:block;width:100%;margin-top:8px}}
-.document{{display:flex;align-items:center;gap:10px;background:var(--panel-2);border-radius:9px;padding:9px;
-  color:var(--text);text-decoration:none;margin:2px 0;border:1px solid var(--line)}}
-.file-icon{{width:38px;height:38px;border-radius:9px;background:linear-gradient(145deg,var(--accent),var(--accent-2));
-  display:grid;place-items:center;font-size:9px;font-weight:800;color:#03141c;flex:none}}
-.file-copy{{min-width:0;flex:1}}
-.file-copy b{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}}
-.file-copy small{{display:block;color:var(--muted);margin-top:3px}}
-.download{{color:var(--accent);font-size:18px}}
-.skipped{{color:var(--muted);font-size:12px;padding:8px 2px}}
+.brand-copy h1 {{ font-size: 14px; font-weight: 700; letter-spacing: -.2px }}
+.brand-copy small {{ color: var(--c-muted); font-size: 11px }}
+.s-search-wrap {{ position: relative }}
+.s-search {{
+  width: 100%; background: var(--c-surface2);
+  border: 1px solid var(--c-border); border-radius: 20px;
+  color: var(--c-text); font-family: inherit; font-size: 12.5px;
+  padding: 8px 34px 8px 12px; outline: none; transition: border-color .18s;
+}}
+.s-search:focus {{ border-color: var(--c-accent) }}
+.s-search-ico {{ position: absolute; right: 11px; top: 9px; color: var(--c-muted); font-size: 13px; pointer-events: none }}
+.s-list {{ flex: 1; overflow-y: auto; padding: 6px 4px }}
+.s-item {{
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 8px; border-radius: var(--r-md);
+  text-decoration: none; color: var(--c-text);
+  margin-bottom: 1px; transition: background .14s;
+  border: 1px solid transparent;
+}}
+.s-item:hover {{ background: var(--c-surface2) }}
+.s-item.active {{
+  background: var(--c-surface2);
+  border-color: color-mix(in srgb, var(--c-accent) 30%, transparent);
+  box-shadow: inset -3px 0 0 var(--c-accent);
+}}
+.s-item.hidden {{ display: none }}
+.s-av {{ width: 40px; height: 40px; border-radius: 12px; object-fit: cover; flex: none }}
+.s-av.fallback {{
+  display: grid; place-items: center; font-weight: 800; font-size: 16px;
+  background: linear-gradient(135deg, var(--c-accent), var(--c-accent2)); color: #03141c;
+}}
+.s-info {{ min-width: 0; flex: 1 }}
+.s-info b {{ display: block; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600 }}
+.s-info small {{ display: block; color: var(--c-muted); font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }}
+.s-cnt {{ font-size: 10px; background: var(--c-accent); color: #03141c; border-radius: 10px; padding: 2px 6px; font-weight: 700; flex: none }}
 
-.meta{{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:2px;padding:0 2px}}
-.reactions:empty{{display:none}}
-.reactions{{display:flex;gap:4px;flex-wrap:wrap}}
-.reaction{{background:var(--accent-soft);border:1px solid var(--line);border-radius:10px;padding:1px 7px;
-  font-size:10.5px;color:#bff3ff}}
-.views{{color:var(--muted);font-size:10.5px}}
-.time{{color:var(--muted);font-size:10.5px;display:inline-flex;align-items:center;gap:3px}}
-.tick{{color:var(--tick);font-size:10px;letter-spacing:-1px}}
+/* ── Main content ── */
+.content {{ flex: 1; min-width: 0; display: flex; flex-direction: column }}
 
-.empty-state{{max-width:720px;margin:50px auto;text-align:center;color:var(--muted);padding:30px}}
-.empty-state.small{{margin:20px auto;padding:14px;font-size:12.5px}}
-.top{{position:fixed;left:20px;bottom:20px;border:1px solid var(--line);background:var(--panel);
-  color:var(--accent);width:40px;height:40px;border-radius:50%;cursor:pointer;font-size:17px;box-shadow:var(--shadow);z-index:15}}
+.topbar {{
+  flex: none; background: var(--c-surface);
+  border-bottom: 1px solid var(--c-border);
+  padding: calc(10px + var(--safe-top)) 14px 10px;
+  display: flex; align-items: center; gap: 10px;
+  position: relative; z-index: 10;
+}}
+.topbar::after {{
+  content:""; position:absolute; bottom:-1px; inset-inline:0;
+  height:1px; background:linear-gradient(90deg,transparent,var(--c-accent) 40%,transparent);
+  opacity:.5;
+}}
+.menu-btn {{
+  display: none; background: var(--c-surface2); border: 1px solid var(--c-border);
+  color: var(--c-accent); width: 36px; height: 36px; border-radius: 9px;
+  font-size: 16px; cursor: pointer; flex: none; align-items: center; justify-content: center;
+}}
+.top-title {{ flex: 1; min-width: 0 }}
+.top-title h2 {{ font-size: 14px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }}
+.top-title p {{ color: var(--c-muted); font-size: 11px; margin-top: 1px }}
 
-.lightbox{{position:fixed;inset:0;background:#000000ee;z-index:40;display:grid;place-items:center;padding:20px;cursor:zoom-out}}
-.lightbox img{{max-width:96vw;max-height:94vh;object-fit:contain;border-radius:10px;box-shadow:0 20px 80px #000}}
+.toolbar {{
+  flex: none; background: var(--c-surface);
+  border-bottom: 1px solid var(--c-border);
+  padding: 10px 14px;
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+}}
+.q-wrap {{ flex: 1; min-width: 0; position: relative }}
+.q-input {{
+  width: 100%; background: var(--c-surface2);
+  border: 1px solid var(--c-border); border-radius: 20px;
+  color: var(--c-text); font-family: inherit; font-size: 13px;
+  padding: 9px 36px 9px 12px; outline: none; transition: border-color .18s;
+}}
+.q-input:focus {{ border-color: var(--c-accent) }}
+.q-ico {{ position: absolute; right: 12px; top: 10px; color: var(--c-muted); font-size: 14px; pointer-events: none }}
+.filters {{ display: flex; gap: 6px; flex-wrap: wrap }}
+.btn-f {{
+  border: 1px solid var(--c-border); background: transparent;
+  color: var(--c-muted); border-radius: 16px; padding: 7px 13px;
+  font-size: 12px; font-family: inherit; cursor: pointer; transition: .15s; white-space: nowrap;
+}}
+.btn-f.on, .btn-f:hover {{ background: var(--c-accent); color: #03141c; border-color: var(--c-accent); font-weight: 600 }}
 
-@media(max-width:900px){{
-  .app-shell{{flex-direction:column;height:100vh}}
-  .menu-toggle{{display:inline-flex;align-items:center;justify-content:center}}
-  .sidebar{{position:fixed;inset:0 20% 0 0;z-index:50;transform:translateX(105%);transition:transform .25s ease;
-    border-left:none;box-shadow:0 0 40px #000}}
-  .sidebar.open{{transform:translateX(0)}}
-  .content{{width:100%}}
-  .bubble{{max-width:88%}}
-  .channel{{margin-top:14px}}
+.scroll {{ flex: 1; overflow-y: auto; padding: 16px 14px calc(20px + var(--safe-bot)) }}
+.info-bar {{ color: var(--c-muted); font-size: 11.5px; margin-bottom: 14px; padding: 0 2px }}
+.info-bar b {{ color: var(--c-accent) }}
+
+/* ── Channel section ── */
+.ch-section {{ margin-bottom: 28px }}
+.ch-head {{
+  display: flex; align-items: center; gap: 12px;
+  background: var(--c-surface); border: 1px solid var(--c-border);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  padding: 12px 14px; position: sticky; top: 0; z-index: 5;
+}}
+.ch-av {{ width: 46px; height: 46px; border-radius: 13px; object-fit: cover; flex: none }}
+.ch-av.fallback {{
+  display: grid; place-items: center; font-size: 20px; font-weight: 800;
+  background: linear-gradient(135deg, var(--c-accent), var(--c-accent2)); color: #03141c;
+}}
+.ch-head-info {{ min-width: 0 }}
+.ch-head-info h2 {{ font-size: 15px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }}
+.ch-head-info p {{ color: var(--c-muted); font-size: 11.5px; margin-top: 2px }}
+.ch-feed {{
+  border: 1px solid var(--c-border); border-top: none;
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
+  background: var(--c-bg);
+  padding: 4px 0 8px;
+}}
+
+/* ── Day divider ── */
+.day-div {{ display: flex; justify-content: center; padding: 14px 0 8px }}
+.day-div span {{
+  background: var(--c-surface2); border: 1px solid var(--c-border);
+  color: var(--c-muted); font-size: 11px; padding: 4px 14px; border-radius: 12px;
+}}
+
+/* ── Post ── */
+.post {{
+  margin: 3px 10px;
+  background: var(--c-bubble);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  transition: border-color .15s;
+}}
+.post:hover {{ border-color: color-mix(in srgb, var(--c-accent) 40%, transparent) }}
+.post-img {{
+  display: block; width: 100%; max-height: 460px;
+  object-fit: cover; cursor: zoom-in;
+}}
+.post-video {{
+  display: block; width: 100%; max-height: 460px; background: #000;
+}}
+.post-audio {{
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px; background: var(--c-surface2);
+  color: var(--c-muted); font-size: 12px;
+}}
+.post-audio audio {{ width: 100% }}
+.post-doc {{
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px; text-decoration: none; color: var(--c-text);
+  background: var(--c-surface2);
+}}
+.doc-icon {{
+  width: 40px; height: 40px; border-radius: 10px; flex: none;
+  background: linear-gradient(135deg,var(--c-accent),var(--c-accent2));
+  display: grid; place-items: center; font-size: 10px; font-weight: 800; color: #03141c;
+}}
+.doc-info {{ flex: 1; min-width: 0 }}
+.doc-info b {{ display: block; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }}
+.doc-info small {{ color: var(--c-muted); font-size: 11px }}
+.doc-dl {{ color: var(--c-accent); font-size: 20px }}
+.post-text {{
+  padding: 10px 12px 4px;
+  font-size: 14.5px; line-height: 1.7;
+  word-break: break-word; white-space: pre-wrap;
+}}
+.empty-msg {{ color: var(--c-muted); font-style: italic }}
+.skipped {{ color: var(--c-muted); font-size: 12px; padding: 10px 12px }}
+.post-foot {{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 12px 8px; gap: 8px;
+}}
+.reacts {{ display: flex; gap: 5px; flex-wrap: wrap }}
+.react {{
+  background: color-mix(in srgb, var(--c-accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c-accent) 25%, transparent);
+  border-radius: 10px; padding: 2px 8px; font-size: 11px; color: #aee8f0;
+}}
+.stats {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0 }}
+.stat {{ color: var(--c-muted); font-size: 11px }}
+.time {{ color: var(--c-muted); font-size: 11px; display: flex; align-items: center; gap: 3px }}
+.ticks {{ color: var(--c-green); font-size: 10px; letter-spacing: -1px }}
+.no-posts {{ color: var(--c-muted); text-align: center; padding: 24px; font-size: 13px }}
+
+/* ── Scroll to top ── */
+.totop {{
+  position: fixed; inset-inline-start: 16px;
+  bottom: calc(20px + var(--safe-bot));
+  width: 42px; height: 42px; border-radius: 50%;
+  background: var(--c-surface2); border: 1px solid var(--c-border);
+  color: var(--c-accent); font-size: 18px; cursor: pointer;
+  display: grid; place-items: center; box-shadow: 0 4px 16px #00000060;
+  z-index: 50; transition: opacity .2s; opacity: 0; pointer-events: none;
+}}
+.totop.vis {{ opacity: 1; pointer-events: auto }}
+
+/* ── Lightbox ── */
+.lbox {{
+  position: fixed; inset: 0; background: #000000f0; z-index: 500;
+  display: none; place-items: center; padding: 16px; cursor: zoom-out;
+}}
+.lbox.on {{ display: grid }}
+.lbox img {{ max-width: 96vw; max-height: 94vh; object-fit: contain; border-radius: 10px }}
+
+/* ── Backdrop (mobile sidebar) ── */
+.backdrop {{
+  display: none; position: fixed; inset: 0; z-index: 190;
+  background: #00000088; backdrop-filter: blur(2px);
+}}
+.backdrop.on {{ display: block }}
+
+/* ── Mobile ── */
+@media (max-width: 860px) {{
+  .menu-btn {{ display: flex }}
+  .sidebar {{
+    position: fixed; top: 0; bottom: 0;
+    /* در RTL، sidebar از سمت راست وارد می‌شود */
+    right: 0; left: auto;
+    transform: translateX(100%);
+    transition: transform .26s cubic-bezier(.4,0,.2,1);
+    box-shadow: -4px 0 24px #00000070;
+  }}
+  .sidebar.open {{ transform: translateX(0) }}
+  .post-img, .post-video {{ max-height: 320px }}
+  .toolbar {{ gap: 6px }}
+  .btn-f {{ padding: 6px 10px; font-size: 11px }}
 }}
 </style>
 </head>
 <body>
-<div class="app-shell">
+
+<div class="shell">
+
+  <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
-    <div class="side-head">
-      <div class="brand"><div class="brand-mark">✦</div><div><h1>آرشیو پیام‌ها</h1><small>{len(channels)} کانال · {total_messages} پیام</small></div></div>
-      <div class="side-search-wrap"><span class="search-icon">⌕</span><input id="sideSearch" class="side-search" type="search" placeholder="جست‌وجوی کانال..." aria-label="جست‌وجوی کانال"></div>
+    <div class="s-head">
+      <div class="brand">
+        <div class="brand-icon">✦</div>
+        <div class="brand-copy">
+          <h1>آرشیو پیام‌ها</h1>
+          <small>{nc} کانال · {total} پیام</small>
+        </div>
+      </div>
+      <div class="s-search-wrap">
+        <span class="s-search-ico">⌕</span>
+        <input id="sSearch" class="s-search" type="search" placeholder="جست‌وجوی کانال...">
+      </div>
     </div>
-    <nav class="side-list" id="sideList">{sidebar_html or '<div class="empty-state small">کانالی موجود نیست.</div>'}</nav>
+    <div class="s-list" id="sList">{s_html}</div>
   </aside>
-  <main class="content" id="content">
+
+  <!-- Main -->
+  <main class="content">
     <header class="topbar">
-      <div class="topbar-inner">
-        <button class="menu-toggle" id="menuToggle" aria-label="فهرست کانال‌ها">☰</button>
-        <div class="count">زمان‌ها به وقت تهران · {len(channels)} کانال · {total_messages} پیام</div>
+      <button class="menu-btn" id="menuBtn">☰</button>
+      <div class="top-title">
+        <h2>آرشیو کانال‌ها</h2>
+        <p>زمان‌ها به وقت تهران · {nc} کانال · {total} پیام</p>
       </div>
     </header>
+
     <div class="toolbar">
-      <div class="search-wrap"><span class="search-icon">⌕</span><input class="search" id="search" type="search" placeholder="جست‌وجو در پیام‌ها..." aria-label="جست‌وجو"></div>
+      <div class="q-wrap">
+        <span class="q-ico">⌕</span>
+        <input id="qInput" class="q-input" type="search" placeholder="جست‌وجو در پیام‌ها...">
+      </div>
       <div class="filters">
-        <button class="filter active" data-filter="all">همه</button>
-        <button class="filter" data-filter="متن">متن</button>
-        <button class="filter" data-filter="image">عکس</button>
-        <button class="filter" data-filter="video">ویدئو</button>
+        <button class="btn-f on" data-f="all">همه</button>
+        <button class="btn-f" data-f="متن">متن</button>
+        <button class="btn-f" data-f="image">عکس</button>
+        <button class="btn-f" data-f="video">ویدئو</button>
       </div>
     </div>
-    <div class="summary" id="summary">نمایش <strong>{total_messages}</strong> پیام از <strong>{len(channels)}</strong> کانال</div>
-    <div class="scroll-area" id="scrollArea">
-      {channel_html or '<div class="empty-state">پیامی برای نمایش وجود ندارد.</div>'}
+
+    <div class="scroll" id="scroll">
+      <p class="info-bar" id="infoBar">نمایش <b>{total}</b> پیام از <b>{nc}</b> کانال</p>
+      {ch_html}
     </div>
-    <button class="top" id="top" aria-label="بازگشت به بالا">↑</button>
   </main>
 </div>
+
+<!-- Backdrop -->
+<div class="backdrop" id="backdrop"></div>
+
+<!-- Scroll to top -->
+<button class="totop" id="totop" aria-label="بازگشت به بالا">↑</button>
+
+<!-- Lightbox -->
+<div class="lbox" id="lbox"><img id="lboxImg" src="" alt=""></div>
+
 <script>
-const search=document.getElementById("search"), filters=[...document.querySelectorAll(".filter")],
-      channels=[...document.querySelectorAll(".channel")], summary=document.getElementById("summary"),
-      sideSearch=document.getElementById("sideSearch"), sideItems=[...document.querySelectorAll(".side-item")],
-      sidebar=document.getElementById("sidebar"), menuToggle=document.getElementById("menuToggle"),
-      scrollArea=document.getElementById("scrollArea");
-let active="all";
+(function(){{
+  const sidebar  = document.getElementById('sidebar');
+  const backdrop = document.getElementById('backdrop');
+  const menuBtn  = document.getElementById('menuBtn');
+  const scroll   = document.getElementById('scroll');
+  const qInput   = document.getElementById('qInput');
+  const infoBar  = document.getElementById('infoBar');
+  const sSearch  = document.getElementById('sSearch');
+  const totop    = document.getElementById('totop');
+  const lbox     = document.getElementById('lbox');
+  const lboxImg  = document.getElementById('lboxImg');
+  const filters  = [...document.querySelectorAll('.btn-f')];
+  const sItems   = [...document.querySelectorAll('.s-item')];
+  const posts    = [...document.querySelectorAll('.post')];
+  const sections = [...document.querySelectorAll('.ch-section')];
 
-function apply(){{
-  const q=(search.value||"").trim().toLocaleLowerCase();
-  let visible=0,visibleChannels=0;
-  channels.forEach(ch=>{{
-    let shown=0;
-    const channelName=(ch.dataset.channel||"").toLocaleLowerCase();
-    ch.querySelectorAll(".msg-row").forEach(row=>{{
-      const okType=active==="all"||row.dataset.type===active;
-      const okText=!q||channelName.includes(q)||(row.dataset.search||"").includes(q);
-      const visibleRow=okType&&okText;
-      row.hidden=!visibleRow;
-      if(visibleRow)shown++;
+  let activeF = 'all';
+
+  function openSidebar()  {{ sidebar.classList.add('open');  backdrop.classList.add('on'); }}
+  function closeSidebar() {{ sidebar.classList.remove('open'); backdrop.classList.remove('on'); }}
+  menuBtn.addEventListener('click', openSidebar);
+  backdrop.addEventListener('click', closeSidebar);
+  sItems.forEach(a => a.addEventListener('click', closeSidebar));
+
+  // Search + filter
+  function refilter() {{
+    const q = (qInput.value || '').trim().toLocaleLowerCase();
+    let vPosts = 0, vSections = 0;
+    sections.forEach(sec => {{
+      let shown = 0;
+      const chName = (sec.dataset.ch || '').toLocaleLowerCase();
+      sec.querySelectorAll('.post').forEach(p => {{
+        const okT = activeF === 'all' || p.dataset.t === activeF;
+        const okQ = !q || chName.includes(q) || (p.dataset.s || '').includes(q);
+        p.hidden = !(okT && okQ);
+        if (!p.hidden) shown++;
+      }});
+      sec.querySelectorAll('.day-div').forEach(d => {{
+        let sib = d.nextElementSibling, has = false;
+        while (sib && !sib.classList.contains('day-div')) {{
+          if (!sib.hidden) {{ has = true; break; }} sib = sib.nextElementSibling;
+        }}
+        d.hidden = !has;
+      }});
+      sec.hidden = !shown;
+      if (shown) {{ vSections++; vPosts += shown; }}
     }});
-    ch.querySelectorAll(".day-sep").forEach(sep=>{{
-      let node=sep.nextElementSibling,hasVisible=false;
-      while(node&&!node.classList.contains("day-sep")){{
-        if(!node.hidden){{hasVisible=true;break}}
-        node=node.nextElementSibling;
-      }}
-      sep.hidden=!hasVisible;
-    }});
-    ch.hidden=!shown;
-    if(shown)visibleChannels++;
-    visible+=shown;
+    infoBar.innerHTML = `نمایش <b>${{vPosts}}</b> پیام از <b>${{vSections}}</b> کانال`;
+  }}
+
+  qInput.addEventListener('input', refilter);
+  filters.forEach(btn => btn.addEventListener('click', () => {{
+    filters.forEach(b => b.classList.remove('on'));
+    btn.classList.add('on');
+    activeF = btn.dataset.f;
+    refilter();
+  }}));
+
+  // Sidebar channel search
+  sSearch.addEventListener('input', () => {{
+    const q = (sSearch.value || '').trim().toLocaleLowerCase();
+    sItems.forEach(a => a.classList.toggle('hidden', q ? !(a.dataset.sk || '').includes(q) : false));
   }});
-  summary.innerHTML=`نمایش <strong>${{visible}}</strong> پیام از <strong>${{visibleChannels}}</strong> کانال`;
-}}
-search.addEventListener("input",apply);
-filters.forEach(btn=>btn.addEventListener("click",()=>{{filters.forEach(x=>x.classList.remove("active"));btn.classList.add("active");active=btn.dataset.filter;apply()}}));
 
-document.getElementById("top").addEventListener("click",()=>scrollArea.scrollTo({{top:0,behavior:"smooth"}}));
+  // Scroll to top button
+  scroll.addEventListener('scroll', () => totop.classList.toggle('vis', scroll.scrollTop > 300));
+  totop.addEventListener('click', () => scroll.scrollTo({{top:0,behavior:'smooth'}}));
 
-document.addEventListener("click",event=>{{
-  const image=event.target.closest(".media-image");
-  if(!image)return;
-  event.preventDefault();
-  const layer=document.createElement("div");
-  layer.className="lightbox";
-  const copy=document.createElement("img");
-  copy.src=image.src;
-  layer.appendChild(copy);
-  layer.onclick=()=>layer.remove();
-  document.body.appendChild(layer);
-}});
-
-if(sideSearch){{
-  sideSearch.addEventListener("input",()=>{{
-    const q=(sideSearch.value||"").trim().toLocaleLowerCase();
-    sideItems.forEach(item=>{{
-      const ok=!q||(item.dataset.search||"").includes(q);
-      item.classList.toggle("filtered-out",!ok);
-    }});
+  // Lightbox
+  document.addEventListener('click', e => {{
+    const img = e.target.closest('.post-img');
+    if (img) {{ lboxImg.src = img.src; lbox.classList.add('on'); e.preventDefault(); }}
   }});
-}}
+  lbox.addEventListener('click', () => {{ lbox.classList.remove('on'); lboxImg.src = ''; }});
+  document.addEventListener('keydown', e => {{ if (e.key === 'Escape') lbox.classList.remove('on'); }});
 
-if(menuToggle){{
-  menuToggle.addEventListener("click",()=>sidebar.classList.toggle("open"));
-  sideItems.forEach(item=>item.addEventListener("click",()=>sidebar.classList.remove("open")));
-}}
-
-if("IntersectionObserver" in window && channels.length){{
-  const byId=Object.fromEntries(sideItems.map(item=>[item.dataset.target,item]));
-  const observer=new IntersectionObserver(entries=>{{
-    entries.forEach(entry=>{{
-      const item=byId[entry.target.id];
-      if(!item)return;
-      if(entry.isIntersecting)item.classList.add("active");
-      else item.classList.remove("active");
-    }});
-  }},{{root:scrollArea,rootMargin:"-40% 0px -55% 0px",threshold:0}});
-  channels.forEach(ch=>observer.observe(ch));
-}}
+  // Sidebar active highlight on scroll
+  if ('IntersectionObserver' in window) {{
+    const byId = Object.fromEntries(sItems.map(a => [a.dataset.target, a]));
+    new IntersectionObserver(entries => {{
+      entries.forEach(e => {{
+        const a = byId[e.target.id];
+        if (a) a.classList.toggle('active', e.isIntersecting);
+      }});
+    }}, {{root: scroll, rootMargin: '-30% 0px -60% 0px', threshold: 0}})
+    .observe(...sections.length ? sections : [document.body]);
+    sections.forEach(s => new IntersectionObserver(entries => {{
+      entries.forEach(e => {{
+        const a = byId[e.target.id];
+        if (a) a.classList.toggle('active', e.isIntersecting);
+      }});
+    }}, {{root: scroll, rootMargin: '-30% 0px -60% 0px', threshold: 0}}).observe(s));
+  }}
+}})();
 </script>
 </body>
 </html>"""
